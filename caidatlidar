@@ -1,0 +1,46 @@
+ls /dev/ttyUSB*
+
+/dev/ttyUSB0
+
+dmesg | grep tty
+
+sudo usermod -a -G dialout $USER
+sudo reboot
+
+sudo apt install -y ros-humble-rplidar-ros
+
+ros2 pkg list | grep rplidar
+
+source /opt/ros/humble/setup.bash
+
+ros2 launch rplidar_ros rplidar.launch.py
+
+ros2 topic list
+
+ros2 topic echo /scan
+
+rviz2
+
+ros2 launch rplidar_ros rplidar.launch.py \
+serial_port:=/dev/ttyUSB0 \
+serial_baudrate:=115200 \
+frame_id:=laser \
+inverted:=false \
+angle_compensate:=true
+
+sudo nano /etc/udev/rules.d/99-rplidar.rules
+
+KERNEL=="ttyUSB*", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", SYMLINK+="rplidar"
+
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+
+/dev/rplidar
+  
+ros2 launch slam_toolbox online_async_launch.py \
+use_sim_time:=false
+
+ros2 run tf2_ros static_transform_publisher \
+0 0 0 0 0 0 base_link laser
+
+
