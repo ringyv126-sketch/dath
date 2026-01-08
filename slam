@@ -1,0 +1,22 @@
+ros2 node list
+
+/rplidar_node
+
+ros2 topic list
+
+/scan
+
+ros2 topic echo /scan
+
+rviz2
+
+ros2 run tf2_ros static_transform_publisher \
+0 0 0.15 0 0 0 base_link laser
+
+ros2 run tf2_tools view_frames
+
+sudo apt install ros-humble-slam-toolbox
+
+ros2 launch slam_toolbox online_async_launch.py
+
+ros2 run nav2_map_server map_saver_cli -f my_map
