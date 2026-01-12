@@ -1,0 +1,902 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.widgets import Button, TextBox import time
+import math 
+import traceback 
+import serial 
+import threading 
+import os
+import json
+from rplidar import RPLidar
+from simple_breezyslam import RMHC_SLAM from astar import find_path
+
+# Import quản lý bản đồ
+try:
+from map_manager import MapManager MAP_MANAGER_AVAILABLE = True
+except ImportError:
+print("Thông báo: Module map_manager không có sẵn. Một số tính năng quản lý bản đồ sẽ bị hạn chế.")
+MAP_MANAGER_AVAILABLE = False
+
+
+#	CẤU HÌNH
+try:
+config_file = 'robot_config.json' if os.path.exists(config_file):
+with open(config_file, 'r') as f:
+config = json.load(f)
+
+
+# Đọc thông số từ file cấu hình nếu có
+LIDAR_PORT = config.get('LIDAR_PORT', '/dev/ttyUSB1') ESP32_PORT = config.get('ESP32_PORT', '/dev/ttyUSB0') MAP_SIZE_PIXELS = config.get('MAP_SIZE_PIXELS', 500) MAP_SIZE_METERS = config.get('MAP_SIZE_METERS', 15) MOVE_SPEED = config.get('MOVE_SPEED', 130) TURN_SPEED = config.get('TURN_SPEED', 100)
+UPDATE_INTERVAL_MS = config.get('UPDATE_INTERVAL_MS', 100) DEBUG_LEVEL = config.get('DEBUG_LEVEL', 1)
+LOADED_MAP = config.get('LOADED_MAP', None) else:
+# Mặc định nếu không có file cấu hình LIDAR_PORT = '/dev/ttyUSB1' ESP32_PORT = '/dev/ttyUSB0'
+ 
+
+
+
+MAP_SIZE_PIXELS = 500
+MAP_SIZE_METERS = 15
+MOVE_SPEED = 130
+TURN_SPEED = 100
+UPDATE_INTERVAL_MS = 100
+DEBUG_LEVEL = 1 LOADED_MAP = None
+except Exception as e:
+print(f"Lỗi khi đọc cấu hình, sử dụng giá trị mặc định: {e}") # Mặc định nếu không đọc được file cấu hình LIDAR_PORT = '/dev/ttyUSB1'
+ESP32_PORT = '/dev/ttyUSB0' MAP_SIZE_PIXELS = 500
+MAP_SIZE_METERS = 15
+MOVE_SPEED = 130
+TURN_SPEED = 100
+UPDATE_INTERVAL_MS = 100
+DEBUG_LEVEL = 1 LOADED_MAP = None
+
+# ---------- LỚP ĐIỀU KHIỂN ROBOT ----------
+class RobotController:
+def  init  (self, port=ESP32_PORT):
+self.connected = False self.serial = None self.current_left_speed = 0
+self.current_right_speed = 0
+
+
+try:
+self.serial = serial.Serial(port, 115200, timeout=1) time.sleep(2) # Chờ kết nối ổn định
+
+# Kiểm tra kết nối self.serial.write(b"PING\n") time.sleep(0.5)
+if self.serial.in_waiting:
+response = self.serial.read(self.serial.in_waiting).decode('utf-8', errors='ignore').strip() if "PONG" in response:
+print(f"Đã kết nối với ESP32 tại {port}")
+self.connected = True
+
+
+if not self.connected:
+print(f"ESP32 không phản hồi tại {port}")
+except Exception as e:
+print(f"Không thể kết nối với ESP32: {e}") print("Sử dụng chế độ mô phỏng điều khiển")
+ 
+
+
+
+def move(self, left_speed, right_speed):
+"""Đặt tốc độ cho hai bánh xe (-255 đến 255)""" self.current_left_speed = max(-255, min(255, left_speed)) self.current_right_speed = max(-255, min(255, right_speed))
+
+if self.connected and self.serial:
+try:
+command = f"MOVE:{self.current_left_speed}:{self.current_right_speed}\n" self.serial.write(command.encode())
+except Exception as e:
+print(f"Lỗi khi gửi lệnh: {e}")
+else:
+# Chỉ in ra nếu đang mô phỏng
+if DEBUG_LEVEL > 0:
+print(f"Mô phỏng: MOVE:{left_speed}:{right_speed}")
+
+def set_speeds(self, left_speed, right_speed): """Chuyển tiếp đến hàm move để thống nhất API""" return self.move(left_speed, right_speed)
+
+def stop(self):
+"""Dừng robot"""
+if self.connected and self.serial: try:
+self.serial.write(b"STOP\n") self.current_left_speed = 0
+self.current_right_speed = 0 except Exception as e:
+print(f"Lỗi khi gửi lệnh dừng: {e}")
+else:
+print("Mô phỏng: STOP")
+
+
+def get_speeds(self):
+"""Lấy tốc độ hiện tại của hai bánh xe"""
+return {
+'left': self.current_left_speed, 'right': self.current_right_speed
+}
+
+
+def disconnect(self):
+"""Ngắt kết nối với ESP32"""
+if self.connected and self.serial: try:
+self.stop() self.serial.close()
+print("Đã ngắt kết nối với ESP32")
+except:
+ 
+
+
+
+pass
+
+
+def get_distances(self):
+"""Đọc khoảng cách từ cảm biến siêu âm"""
+if not self.connected or not self.serial:
+# Trả về khoảng cách giả trong chế độ mô phỏng
+return (200, 200, 200)
+
+
+try:
+# Xóa bộ đệm
+self.serial.reset_input_buffer()
+
+# Gửi lệnh self.serial.write(b"GET_DIST\n") time.sleep(0.1)
+
+# Đọc phản hồi
+if self.serial.in_waiting:
+response = self.serial.readline().decode('utf-8', errors='ignore').strip()
+
+
+# Format: "DIST:left:front:right" if response.startswith("DIST:"):
+parts = response.split(":") if len(parts) >= 4:
+left = float(parts[1]) front = float(parts[2]) right = float(parts[3]) return (left, front, right)
+
+return None
+except Exception as e:
+print(f"Lỗi khi đọc cảm biến: {e}")
+return None
+
+
+# ---------- HÀM CHÍNH ----------
+def run_slam_with_breezy():
+"""
+Hàm chính để chạy SLAM sử dụng BreezySLAM với tích hợp A*.
+"""
+# --- BIẾN TOÀN CỤC ---
+global MOVE_SPEED, TURN_SPEED
+
+
+# --- KHỞI TẠO CÁC THÀNH PHẦN ---
+controller = RobotController()
+
+
+# Khởi tạo quản lý bản đồ
+map_manager = None
+ 
+
+
+
+if MAP_MANAGER_AVAILABLE:
+map_manager = MapManager()
+print("Khởi tạo hệ thống quản lý bản đồ")
+
+
+# Khởi tạo BreezySLAM
+slam = RMHC_SLAM( scan_size_in_points=360, map_size_pixels=MAP_SIZE_PIXELS, map_size_meters=MAP_SIZE_METERS, map_quality=7
+)
+
+# Tính kích thước của mỗi ô trên bản đồ (mm)
+hole_width_mm = int(MAP_SIZE_METERS * 1000 / MAP_SIZE_PIXELS)
+
+# Khởi tạo các biến
+map_bytes = bytearray(MAP_SIZE_PIXELS * MAP_SIZE_PIXELS) robot_pose = [0, 0, 0] # [x_mm, y_mm, theta_degrees] path_to_target = []  # Đường đi từ robot đến mục tiêu target_position = None # Điểm đích
+robot_state = "IDLE"  # Trạng thái: IDLE, MOVING, AVOIDING, MANUAL
+view_mode = "follow"  # Chế độ xem: "follow" (theo robot) hoặc "full" (toàn bản đồ)
+
+
+# Thêm biến quản lý waypoints waypoints = {} editing_waypoints = False current_waypoint_name = None selected_waypoint = None
+
+# Biến để kiểm soát luồng chạy
+running = True current_scan = []
+current_raw_points = [] # Lưu trữ điểm quét thô (pixel) cho hiển thị map_updated = False	# Đánh dấu khi bản đồ cập nhật last_map_save_time = time.time()
+map_save_interval = 60 # Lưu bản đồ mỗi 60 giây
+
+
+# Đường đi của robot
+robot_path = []
+
+
+# Nếu có bản đồ được chỉ định để tải
+if LOADED_MAP and MAP_MANAGER_AVAILABLE and map_manager:
+print(f"Đang tải bản đồ: {LOADED_MAP}")
+map_name = os.path.basename(LOADED_MAP).replace('.png', '').replace('.npy', '') loaded_map, loaded_waypoints = map_manager.load_map(map_name)
+
+if loaded_map is not None:
+ 
+
+
+
+# Chuyển bản đồ từ numpy array sang bytearray
+map_bytes = bytearray(loaded_map.flatten())
+# Tải waypoints nếu có
+if loaded_waypoints:
+waypoints = loaded_waypoints
+print(f"Đã tải {len(waypoints)} điểm dừng") print(f"Đã tải bản đồ thành công: {map_name}")
+else:
+print(f"Không thể tải bản đồ {map_name}, khởi tạo bản đồ trống")
+
+
+# --- THIẾT LẬP MATPLOTLIB ---
+plt.ion()
+fig, ax = plt.subplots(figsize=(10, 10))
+
+# Dành không gian cho các nút điều khiển
+fig.subplots_adjust(bottom=0.2)
+
+# Tạo các đối tượng hiển thị
+map_image = ax.imshow(np.zeros((MAP_SIZE_PIXELS, MAP_SIZE_PIXELS)), cmap='gray_r', origin='lower')
+robot_plot, = ax.plot([], [], 'bo', markersize=8) robot_direction, = ax.plot([], [], 'b-', linewidth=2) target_plot, = ax.plot([], [], 'ro', markersize=8) path_plot, = ax.plot([], [], 'g-', linewidth=2
+history_plot, = ax.plot([], [], 'm-', linewidth=1)
+scan_plot, = ax.plot([], [], 'r.', markersize=2) waypoint_plots = []
+
+# Thiết lập tiêu đề và giới hạn trục
+ax.set_title("SLAM với BreezySLAM và A* Pathfinding")
+ax.set_xlim(0, MAP_SIZE_PIXELS) ax.set_ylim(0, MAP_SIZE_PIXELS)
+
+# Tạo các nút điều khiển bằng chuột
+btn_up_ax = plt.axes([0.45, 0.08, 0.1, 0.05])
+btn_down_ax = plt.axes([0.45, 0.01, 0.1, 0.05])
+btn_left_ax = plt.axes([0.35, 0.04, 0.08, 0.05])
+btn_right_ax = plt.axes([0.57, 0.04, 0.08, 0.05])
+btn_stop_ax = plt.axes([0.45, 0.04, 0.1, 0.05])
+btn_view_ax = plt.axes([0.75, 0.04, 0.2, 0.05])
+btn_reset_ax = plt.axes([0.15, 0.04, 0.15, 0.05])
+btn_save_ax = plt.axes([0.75, 0.01, 0.2, 0.03])
+btn_waypoint_ax = plt.axes([0.15, 0.01, 0.15, 0.03])
+
+
+btn_up = Button(btn_up_ax, 'Tiến') btn_down = Button(btn_down_ax, 'Lùi') btn_left = Button(btn_left_ax, 'Trái')
+ 
+
+
+
+btn_right = Button(btn_right_ax, 'Phải') btn_stop = Button(btn_stop_ax, 'Dừng')
+btn_view = Button(btn_view_ax, 'Chuyển chế độ xem') btn_reset = Button(btn_reset_ax, 'Reset bản đồ') btn_save = Button(btn_save_ax, 'Lưu bản đồ')
+btn_waypoint = Button(btn_waypoint_ax, 'Chỉnh sửa điểm dừng')
+
+
+# Thêm vùng nhập tên waypoint khi click trong chế độ edit waypoint waypoint_name_ax = plt.axes([0.35, 0.01, 0.08, 0.03]) waypoint_name_textbox = TextBox(waypoint_name_ax, 'Tên điểm: ', initial='') waypoint_name_ax.set_visible(False)
+
+# --- HÀM XỬ LÝ SỰ KIỆN ---
+def on_click(event):
+nonlocal target_position, robot_state, path_to_target, waypoints, editing_waypoints, current_waypoint_name
+
+
+# Kiểm tra xem có phải click vào bản đồ không
+if event.inaxes == ax:
+if event.xdata is not None and event.ydata is not None: x, y = int(event.xdata), int(event.ydata)
+
+# Nếu đang ở chế độ chỉnh sửa waypoints
+if editing_waypoints:
+# Kiểm tra xem đang nhấn vào waypoint hiện có không
+clicked_waypoint = None
+for name, (wx, wy) in waypoints.items():
+if abs(wx - x) < 10 and abs(wy - y) < 10: # Phạm vi 10 pixel
+clicked_waypoint = name break
+
+if clicked_waypoint:
+# Xóa waypoint nếu click chuột phải
+if event.button == 3: # Chuột phải
+del waypoints[clicked_waypoint]
+print(f"Đã xóa điểm dừng: {clicked_waypoint}")
+update_waypoints_display() return
+else:
+print(f"Điểm dừng: {clicked_waypoint} tại ({x}, {y})")
+else:
+# Thêm waypoint mới
+current_waypoint_name = f"Điểm {len(waypoints) + 1}"
+waypoints[current_waypoint_name] = (x, y)
+print(f"Đã thêm điểm dừng '{current_waypoint_name}' tại ({x}, {y})")
+update_waypoints_display() return
+ 
+
+
+
+# Kiểm tra xem có nhấn vào waypoint không (khi không ở chế độ chỉnh sửa)
+for name, (wx, wy) in waypoints.items():
+if abs(wx - x) < 10 and abs(wy - y) < 10: # Phạm vi 10 pixel print(f"Đi đến điểm dừng: {name} tại ({wx}, {wy})")
+x, y = wx, wy # Sử dụng tọa độ chính xác của waypoint break
+
+print(f"Đặt điểm đích mới tại ({x}, {y})")
+
+
+# Lấy vị trí robot hiện tại
+robot_x = int(MAP_SIZE_PIXELS / 2 + (robot_pose[0] / (MAP_SIZE_METERS * 1000) * MAP_SIZE_PIXELS)) robot_y = int(MAP_SIZE_PIXELS / 2 + (robot_pose[1] / (MAP_SIZE_METERS * 1000) * MAP_SIZE_PIXELS))
+
+# Chuyển đổi bản đồ từ dạng byte sang mảng numpy
+map_array = np.reshape(np.frombuffer(map_bytes, dtype=np.uint8), (MAP_SIZE_PIXELS, MAP_SIZE_PIXELS))
+
+# Tìm đường đi sử dụng A* start = (robot_x, robot_y) goal = (x, y)
+
+path = find_path(map_array, start, goal)
+
+
+if path:
+print(f"Đã tìm thấy đường đi với {len(path)} điểm")
+path_to_target = path target_position = (x, y) robot_state = "MOVING"
+else:
+print("Không thể tìm đường đi đến điểm đích!")
+
+
+# Hàm cập nhật hiển thị waypoints
+def update_waypoints_display():
+nonlocal waypoint_plots
+
+
+# Xóa các waypoint plots cũ
+for plot in waypoint_plots:
+if isinstance(plot, tuple) and len(plot) == 2: plot[0].remove()
+plot[1].remove() waypoint_plots = []
+# Vẽ lại các waypoints
+for name, (x, y) in waypoints.items():
+point = ax.plot(x, y, 'g*', markersize=10)[0]
+text = ax.annotate(name, (x + 5, y + 5), fontsize=8, color='green')
+ 
+
+
+
+waypoint_plots.append((point, text)) plt.draw()
+# Hàm xử lý phím
+def on_key(event):
+nonlocal running, robot_state, map_bytes, robot_path, view_mode, editing_waypoints, waypoints global MOVE_SPEED, TURN_SPEED
+
+print(f"Phím được nhấn: {event.key}")
+
+
+if event.key == 'q':
+print("Thoát chương trình.")
+running = False elif event.key == 's':
+# Lưu bản đồ khi người dùng nhấn phím 's'
+save_current_map()
+elif event.key == ' ': # Space print("Dừng robot.") controller.stop() robot_state = "IDLE" path_to_target = []
+elif event.key == 'r':
+print("Reset bản đồ.")
+map_bytes = bytearray(MAP_SIZE_PIXELS * MAP_SIZE_PIXELS) robot_path = []
+path_to_target = [] robot_state = "IDLE"
+elif event.key == 'v' or event.key == 'V': toggle_view_mode()
+elif event.key == 'w': # Chế độ waypoint
+toggle_waypoint_mode()
+
+
+# Điều khiển thủ công bằng phím
+elif event.key == 'i': # Thay thế cho up arrow # Đi thẳng
+controller.move(-MOVE_SPEED, -MOVE_SPEED) robot_state = "MANUAL"
+print("Di chuyển tiến")
+elif event.key == 'k': # Thay thế cho down arrow # Đi lùi
+controller.move(MOVE_SPEED, MOVE_SPEED) robot_state = "MANUAL"
+print("Di chuyển lùi")
+elif event.key == 'j': # Thay thế cho left arrow
+# Quay trái
+controller.move(-TURN_SPEED, TURN_SPEED)
+ 
+
+
+
+robot_state = "MANUAL" print("Quay trái")
+elif event.key == 'l': # Thay thế cho right arrow # Quay phải
+controller.move(TURN_SPEED, -TURN_SPEED) robot_state = "MANUAL"
+print("Quay phải")
+
+
+# Điều chỉnh tốc độ và điều khiển tinh chỉnh
+elif event.key == 'w':
+# Tăng tốc độ
+MOVE_SPEED = min(255, MOVE_SPEED + 10)
+print(f"Tốc độ di chuyển: {MOVE_SPEED}")
+elif event.key == 'x':
+# Giảm tốc độ
+MOVE_SPEED = max(50, MOVE_SPEED - 10)
+print(f"Tốc độ di chuyển: {MOVE_SPEED}")
+elif event.key == 'a':
+# Rẽ trái nhẹ (không quay tại chỗ) controller.move(MOVE_SPEED//2, MOVE_SPEED) robot_state = "MANUAL"
+print("Rẽ trái nhẹ")
+elif event.key == 'd':
+# Rẽ phải nhẹ (không quay tại chỗ) controller.move(MOVE_SPEED, MOVE_SPEED//2) robot_state = "MANUAL"
+print("Rẽ phải nhẹ")
+
+
+# Các hàm xử lý sự kiện cho nút điều khiển
+def move_forward(event):
+nonlocal robot_state
+controller.move(-MOVE_SPEED, -MOVE_SPEED) robot_state = "MANUAL"
+print("Di chuyển tiến")
+
+
+def move_backward(event):
+nonlocal robot_state controller.move(MOVE_SPEED, MOVE_SPEED) robot_state = "MANUAL"
+print("Di chuyển lùi")
+
+
+def turn_left(event):
+nonlocal robot_state
+controller.move(-TURN_SPEED, TURN_SPEED) robot_state = "MANUAL"
+print("Quay trái")
+ 
+
+
+
+def turn_right(event):
+nonlocal robot_state controller.move(TURN_SPEED, -TURN_SPEED) robot_state = "MANUAL"
+print("Quay phải")
+
+
+def stop_robot(event):
+nonlocal robot_state, path_to_target controller.stop()
+robot_state = "IDLE" path_to_target = [] print("Dừng robot")
+
+def toggle_view_mode(event=None):
+nonlocal view_mode
+if view_mode == "follow":
+view_mode = "full"
+print("Chế độ xem: Toàn bộ bản đồ")
+btn_view.label.set_text("Xem theo robot") else:
+view_mode = "follow"
+print("Chế độ xem: Theo dõi robot") btn_view.label.set_text("Xem toàn bản đồ")
+plt.draw()
+
+
+def toggle_waypoint_mode(event=None):
+nonlocal editing_waypoints editing_waypoints = not editing_waypoints if editing_waypoints:
+btn_waypoint.label.set_text('Kết thúc chỉnh sửa') print("Chế độ chỉnh sửa điểm dừng: BẬT")
+print("Click để thêm điểm dừng, click chuột phải để xóa điểm dừng")
+# waypoint_name_ax.set_visible(True) else:
+btn_waypoint.label.set_text('Chỉnh sửa điểm dừng') print("Chế độ chỉnh sửa điểm dừng: TẮT")
+# waypoint_name_ax.set_visible(False) plt.draw()
+
+def reset_map(event):
+nonlocal map_bytes, robot_path, path_to_target, robot_state, waypoints
+print("Reset bản đồ.")
+map_bytes = bytearray(MAP_SIZE_PIXELS * MAP_SIZE_PIXELS) robot_path = []
+path_to_target = []
+waypoints = {} # Xóa tất cả waypoints
+update_waypoints_display() # Cập nhật hiển thị
+ 
+
+
+
+robot_state = "IDLE"
+
+
+def save_current_map(event=None):
+"""Lưu bản đồ hiện tại"""
+map_name = f"map_{time.strftime('%Y%m%d_%H%M%S')}"
+
+
+if MAP_MANAGER_AVAILABLE and map_manager: # Tạo dữ liệu bản đồ với thông tin liên quan map_data = {
+'occupancy_map': np.reshape(np.frombuffer(map_bytes, dtype=np.uint8), (MAP_SIZE_PIXELS, MAP_SIZE_PIXELS)),
+'resolution': MAP_SIZE_METERS / MAP_SIZE_PIXELS, 'size_meters': MAP_SIZE_METERS,
+'path': robot_path
+}
+
+
+saved_map = map_manager.save_map(map_name, map_data, waypoints)
+print(f"Đã lưu bản đồ với {len(waypoints)} điểm dừng vào: {saved_map}")
+else:
+# Phương pháp lưu cũ
+filename = f"{map_name}.png" plt.savefig(filename)
+print(f"Đã lưu bản đồ vào {filename}")
+
+
+# Đăng ký sự kiện cho các nút btn_up.on_clicked(move_forward) btn_down.on_clicked(move_backward) btn_left.on_clicked(turn_left) btn_right.on_clicked(turn_right) btn_stop.on_clicked(stop_robot) btn_view.on_clicked(toggle_view_mode) btn_reset.on_clicked(reset_map) btn_save.on_clicked(save_current_map) btn_waypoint.on_clicked(toggle_waypoint_mode)
+
+# Đăng ký các sự kiện fig.canvas.mpl_connect('button_press_event', on_click) fig.canvas.mpl_connect('key_press_event', on_key)
+
+# --- HÀM ĐIỀU HƯỚNG ROBOT ---
+def navigate_to_target():
+nonlocal robot_state, path_to_target, target_position if robot_state != "MOVING" or not path_to_target:
+return
+
+
+# Lấy điểm tiếp theo trong đường đi
+next_waypoint = path_to_target[0]
+ 
+
+
+
+
+# Vị trí robot hiện tại (pixel)
+robot_x = int(MAP_SIZE_PIXELS / 2 + (robot_pose[0] / (MAP_SIZE_METERS * 1000) * MAP_SIZE_PIXELS)) robot_y = int(MAP_SIZE_PIXELS / 2 + (robot_pose[1] / (MAP_SIZE_METERS * 1000) * MAP_SIZE_PIXELS)) robot_theta = math.radians(robot_pose[2])
+
+# Tính vector từ robot đến điểm tiếp theo
+dx = next_waypoint[0] - robot_x dy = next_waypoint[1] - robot_y
+distance = math.sqrt(dx*dx + dy*dy)
+
+
+# Nếu đã đến điểm này
+if distance < 5: # Ngưỡng 5 pixel
+path_to_target.pop(0) if not path_to_target:
+print("Đã đến mục tiêu!") controller.stop() robot_state = "IDLE"
+return
+
+
+# Tính góc đến điểm tiếp theo
+target_angle = math.atan2(dy, dx)
+
+
+# Tính sự khác biệt góc
+angle_diff = (target_angle - robot_theta) % (2 * math.pi) if angle_diff > math.pi:
+angle_diff -= 2 * math.pi
+
+
+# Thêm biến đếm và kiểm tra thời gian xoay
+# Nếu xoay quá 2 giây mà góc chênh lệch vẫn lớn, chuyển qua chế độ di chuyển
+current_time = time.time()
+if not hasattr(navigate_to_target, "rotation_start_time"): navigate_to_target.rotation_start_time = current_time navigate_to_target.last_angle_diff = angle_diff
+
+# Nếu xoay quá 2 giây mà không cải thiện góc, thử di chuyển
+force_move = False
+if abs(angle_diff) > 0.15 and current_time - navigate_to_target.rotation_start_time > 2.0:
+if abs(navigate_to_target.last_angle_diff) - abs(angle_diff) < 0.05: # Không cải thiện đáng kể
+force_move = True
+print("Đã xoay quá lâu, chuyển sang di chuyển trực tiếp")
+navigate_to_target.rotation_start_time = current_time # Reset timer
+
+
+# Cập nhật góc lệch cuối cùng
+navigate_to_target.last_angle_diff = angle_diff
+
+
+# Nếu cần quay nhiều và chưa bị timeout
+ 
+
+
+
+if abs(angle_diff) > 0.15 and not force_move: # Tăng ngưỡng từ 0.2 lên 0.15 radian (~9 độ) # Reset timer nếu góc lệch nhỏ
+if abs(angle_diff) < 0.3: # Góc lệch đã khá nhỏ
+navigate_to_target.rotation_start_time = current_time
+
+
+# Tính tốc độ quay dựa trên góc lệch
+turn_power = min(0.8, abs(angle_diff) / math.pi) * TURN_SPEED # Giảm hệ số xuống 0.8
+turn_power = max(70, min(100, turn_power)) # Giới hạn tốc độ quay
+
+
+# Quay robot
+if angle_diff > 0:
+controller.move(-turn_power, turn_power) else:
+controller.move(turn_power, -turn_power)
+else:
+# Đi thẳng với tốc độ tỷ lệ với khoảng cách
+move_power = min(0.9, distance / 50) * MOVE_SPEED move_power = max(70, min(130, move_power))
+
+# Thêm điều chỉnh nhẹ để giữ hướng khi di chuyển
+left_adjust = 1.0
+right_adjust = 1.0
+
+
+if abs(angle_diff) > 0.05: # Nếu lệch hơn 3 độ
+steering_factor = min(0.2, abs(angle_diff) * 0.4)
+
+
+if angle_diff > 0:
+right_adjust = 1.0
+left_adjust = 1.0 - steering_factor else:
+left_adjust = 1.0
+right_adjust = 1.0 - steering_factor
+
+
+# Reset rotation timer khi đã chuyển sang chế độ di chuyển
+navigate_to_target.rotation_start_time = current_time
+
+
+# Áp dụng điều chỉnh và di chuyển left_speed = -move_power * left_adjust right_speed = -move_power * right_adjust
+
+controller.move(left_speed, right_speed)
+
+
+# --- HÀM QUÉT LIDAR (CHẠY TRONG THREAD RIÊNG) ---
+def lidar_scan_thread():
+nonlocal running, current_scan, current_raw_points, map_updated lidar = None
+ 
+
+
+
+try:
+os.system(f"sudo fuser -k {LIDAR_PORT}") time.sleep(1)
+
+lidar = RPLidar(LIDAR_PORT, baudrate=115200, timeout=5)
+
+
+# Reset và khởi tạo lại LiDAR # Kết nối và kiểm tra trạng thái lidar.connect()
+health = lidar.get_health() print(f"LiDAR health status: {health}")
+
+# Khởi động motor
+lidar.start_motor()
+print("Đã kết nối với LiDAR.")
+time.sleep(2)
+
+
+# Thực hiện quét thử nghiệm info = lidar.get_info() print(f"LiDAR info: {info}")
+
+for scan in lidar.iter_scans():
+if not running:
+break
+
+
+if DEBUG_LEVEL > 0:
+print(f"Quét {len(scan)} điểm")
+
+
+# Chuyển đổi dữ liệu quét
+filtered_scan = []
+raw_points = [] # Điểm quét trong tọa độ pixel
+
+
+# Lấy vị trí robot hiện tại (pixel)
+robot_x = int(MAP_SIZE_PIXELS / 2 + (robot_pose[0] / (MAP_SIZE_METERS * 1000) * MAP_SIZE_PIXELS)) robot_y = int(MAP_SIZE_PIXELS / 2 + (robot_pose[1] / (MAP_SIZE_METERS * 1000) * MAP_SIZE_PIXELS)) robot_theta = math.radians(robot_pose[2])
+
+# Chuyển đổi và lọc các điểm quét
+for _, angle_deg, distance_mm in scan:
+if 100 <= distance_mm <= 6000: # Chỉ sử dụng điểm từ 10cm đến 6m
+filtered_scan.append((angle_deg, distance_mm))
+
+ 
+
+
+
+
+
+robot_theta)
+ 
+# Tính toán tọa độ pixel của điểm quét (cho hiển thị)
+angle_rad = math.radians(angle_deg)
+point_x = robot_x + (distance_mm / (MAP_SIZE_METERS * 1000) * MAP_SIZE_PIXELS) * math.cos(angle_rad +
+ 
+
+
+
+point_y = robot_y + (distance_mm / (MAP_SIZE_METERS * 1000) * MAP_SIZE_PIXELS) * math.sin(angle_rad +
+robot_theta)
+
+
+raw_points.append((point_x, point_y))
+
+
+current_scan = filtered_scan current_raw_points = raw_points
+map_updated = True # Đánh dấu có cập nhật mới
+
+
+# Giới hạn tần số cập nhật để không tốn quá nhiều CPU
+time.sleep(0.05)
+
+except Exception as e:
+print(f"Lỗi LiDAR: {e}")
+traceback.print_exc()
+
+finally:
+if lidar:
+try:
+lidar.stop_motor() lidar.disconnect()
+print("Đã ngắt kết nối LiDAR.")
+except:
+pass
+
+
+# --- KHỞI ĐỘNG THREAD QUÉT LIDAR ---
+scan_thread = threading.Thread(target=lidar_scan_thread) scan_thread.daemon = True
+scan_thread.start()
+
+
+# --- VÒNG LẶP CHÍNH ---
+try:
+last_update_time = time.time()
+
+
+while running:
+current_time = time.time()
+
+
+# Tự động lưu bản đồ định kỳ
+if current_time - last_map_save_time > map_save_interval:
+auto_file_name = f"auto_map_{time.strftime('%Y%m%d_%H%M%S')}"
+
+
+if MAP_MANAGER_AVAILABLE and map_manager: # Tạo dữ liệu bản đồ với thông tin liên quan map_data = {
+'occupancy_map': np.reshape(np.frombuffer(map_bytes, dtype=np.uint8), (MAP_SIZE_PIXELS, MAP_SIZE_PIXELS)),
+'resolution': MAP_SIZE_METERS / MAP_SIZE_PIXELS,
+ 
+
+
+
+'size_meters': MAP_SIZE_METERS, 'path': robot_path
+}
+
+
+map_manager.save_map(auto_file_name, map_data, waypoints)
+print(f"Đã tự động lưu bản đồ với {len(waypoints)} điểm dừng: {auto_file_name}")
+else:
+# Phương pháp lưu cũ
+plt.savefig(auto_file_name + ".png")
+print(f"Đã tự động lưu bản đồ vào {auto_file_name}.png")
+
+
+last_map_save_time = current_time
+
+# Xử lý dữ liệu quét mới
+if current_scan and map_updated:
+# Chuyển đổi dữ liệu quét sang định dạng mảng
+distances = [] angles = []
+
+for angle, distance in current_scan: distances.append(distance) angles.append(angle)
+
+# Trong phần xử lý dữ liệu quét
+if len(distances) > 0:
+# Lưu vị trí và bản đồ trước khi cập nhật
+old_x, old_y, old_theta = robot_pose
+
+
+# Lưu bản đồ trước khi cập nhật
+old_map = None
+if movement < 10 and rotation > 3: # Đã phát hiện đang quay
+old_map = np.copy(np.reshape(np.frombuffer(map_bytes, dtype=np.uint8), (MAP_SIZE_PIXELS, MAP_SIZE_PIXELS)))
+
+# QUAN TRỌNG: Kiểm tra xem đang quay tại chỗ hay không # Chỉ cập nhật bản đồ nếu không phải quay tại chỗ
+is_rotating = slam.update(distances, scan_angles_degrees=angles, should_update_map=(movement >= 10 or rotation <= 3))
+
+# Lấy vị trí robot từ SLAM
+x_mm, y_mm, theta_degrees = slam.getpos()
+
+
+# Tính chuyển động dx = x_mm - old_x dy = y_mm - old_y
+movement = math.sqrt(dx*dx + dy*dy) rotation = abs(theta_degrees - old_theta)
+ 
+
+
+
+
+if is_rotating or (movement < 10 and rotation > 3):
+# Nếu đang quay tại chỗ
+print(f"Phát hiện xoay tại chỗ: di chuyển={movement:.1f}mm, xoay={rotation:.1f}°") # Giữ nguyên vị trí X, Y nhưng cập nhật góc
+robot_pose = [old_x, old_y, theta_degrees]
+
+
+# QUAN TRỌNG: KHÔNG gọi getmap() khi đang quay tại chỗ # Nếu có bản đồ cũ đã lưu, khôi phục lại
+if old_map is not None: np.copyto(np.reshape(np.frombuffer(map_bytes, dtype=np.uint8),
+(MAP_SIZE_PIXELS, MAP_SIZE_PIXELS)), old_map)
+else:
+# Cập nhật vị trí và bản đồ bình thường nếu đang di chuyển robot_pose = [x_mm, y_mm, theta_degrees] slam.getmap(map_bytes)
+
+# Thêm vào đường đi robot
+if movement > 20: # Chỉ ghi nhận khi di chuyển đáng kể (>2cm)
+robot_x_pixel = int(MAP_SIZE_PIXELS / 2 + (x_mm / (MAP_SIZE_METERS * 1000) * MAP_SIZE_PIXELS)) robot_y_pixel = int(MAP_SIZE_PIXELS / 2 + (y_mm / (MAP_SIZE_METERS * 1000) * MAP_SIZE_PIXELS)) robot_path.append((robot_x_pixel, robot_y_pixel))
+
+map_updated = False # Đặt lại cờ cập nhật
+if robot_state == "MOVING" and path_to_target:
+print(f"Đang điều hướng đến mục tiêu - {len(path_to_target)} điểm còn lại")
+navigate_to_target()
+
+
+# Cập nhật hiển thị mỗi UPDATE_INTERVAL_MS ms
+if current_time - last_update_time > UPDATE_INTERVAL_MS / 1000:
+# Chuyển đổi bản đồ từ dạng byte sang mảng numpy
+map_array = np.reshape(np.frombuffer(map_bytes, dtype=np.uint8), (MAP_SIZE_PIXELS, MAP_SIZE_PIXELS))
+
+# Cập nhật dữ liệu cho ảnh bản đồ
+map_image.set_data(map_array)
+
+
+# Tính vị trí robot trên bản đồ (pixel)
+robot_x = int(MAP_SIZE_PIXELS / 2 + (robot_pose[0] / (MAP_SIZE_METERS * 1000) * MAP_SIZE_PIXELS)) robot_y = int(MAP_SIZE_PIXELS / 2 + (robot_pose[1] / (MAP_SIZE_METERS * 1000) * MAP_SIZE_PIXELS))
+
+# Cập nhật vị trí robot
+robot_plot.set_data([robot_x], [robot_y])
+
+
+# Vẽ hướng robot
+dir_length = 20 # độ dài của đường chỉ hướng
+robot_theta = math.radians(robot_pose[2])
+ 
+
+
+
+dir_x = robot_x + dir_length * math.cos(robot_theta) dir_y = robot_y + dir_length * math.sin(robot_theta)
+robot_direction.set_data([robot_x, dir_x], [robot_y, dir_y])
+
+
+# Vẽ điểm đích
+if target_position:
+target_plot.set_data([target_position[0]], [target_position[1]]) else:
+target_plot.set_data([], [])
+
+
+# Vẽ đường đi A*
+if path_to_target:
+path_x = [p[0] for p in path_to_target] path_y = [p[1] for p in path_to_target] path_plot.set_data(path_x, path_y)
+else:
+path_plot.set_data([], [])
+
+
+# Vẽ đường đi của robot
+if robot_path:
+history_x = [p[0] for p in robot_path] history_y = [p[1] for p in robot_path] history_plot.set_data(history_x, history_y)
+
+# Vẽ các điểm quét LiDAR hiện tại
+if current_raw_points:
+scan_x = [p[0] for p in current_raw_points] scan_y = [p[1] for p in current_raw_points] scan_plot.set_data(scan_x, scan_y)
+
+# Cập nhật hiển thị waypoints (nếu có thay đổi)
+update_waypoints_display()
+
+
+# Điều chỉnh trục dựa trên chế độ xem
+if view_mode == "full":
+# Hiển thị toàn bộ bản đồ ax.set_xlim(0, MAP_SIZE_PIXELS) ax.set_ylim(0, MAP_SIZE_PIXELS)
+
+# Thêm chỉ báo vị trí xem hiện tại lên tiêu đề
+ax.set_title(f"SLAM - Trạng thái: {robot_state} - " +
+f"Vị trí: ({robot_pose[0]/1000:.2f}m, {robot_pose[1]/1000:.2f}m, {robot_pose[2]:.1f}°) - " +
+f"Chế độ xem: TOÀN BẢN ĐỒ")
+else:
+# Chế độ theo dõi robot
+if not target_position:
+margin = 150 # Khoảng cách từ robot đến biên
+ 
+
+
+
+ax.set_xlim(max(0, robot_x - margin), min(MAP_SIZE_PIXELS, robot_x + margin)) ax.set_ylim(max(0, robot_y - margin), min(MAP_SIZE_PIXELS, robot_y + margin))
+else:
+# Nếu có điểm đích, hiển thị cả robot và điểm đích min_x = min(robot_x, target_position[0]) - 50 max_x = max(robot_x, target_position[0]) + 50 min_y = min(robot_y, target_position[1]) - 50 max_y = max(robot_y, target_position[1]) + 50
+# Đảm bảo tỷ lệ khung nhìn hợp lý
+width = max_x - min_x height = max_y - min_y
+if width < 200: width = 200 if height < 200: height = 200 # Giữ tỷ lệ cạnh
+if width > height:
+diff = (width - height) / 2 min_y -= diff
+max_y += diff else:
+diff = (height - width) / 2 min_x -= diff
+max_x += diff
+# Giới hạn trong phạm vi bản đồ
+ax.set_xlim(max(0, min_x), min(MAP_SIZE_PIXELS, max_x)) ax.set_ylim(max(0, min_y), min(MAP_SIZE_PIXELS, max_y))
+# Thêm chỉ báo vị trí xem hiện tại lên tiêu đề
+ax.set_title(f"SLAM - Trạng thái: {robot_state} - " +
+f"Vị trí: ({robot_pose[0]/1000:.2f}m, {robot_pose[1]/1000:.2f}m, {robot_pose[2]:.1f}°) - " +
+f"Chế độ xem: THEO DÕI")
+# Vẽ lại fig.canvas.draw_idle() fig.canvas.flush_events()
+last_update_time = current_time
+# Giới hạn CPU
+time.sleep(0.01)
+# Kiểm tra nếu cửa sổ Matplotlib đã đóng
+if not plt.fignum_exists(fig.number): running = False
+
+except KeyboardInterrupt:
+print("Dừng chương trình bởi người dùng (Ctrl+C).")
+except Exception as e:
+print(f"Lỗi không mong đợi: {e}")
+traceback.print_exc() finally:
+# --- CLEANUP ---
+running = False
+ 
+
+
+
+controller.stop() controller.disconnect()
+# Chờ thread quét LiDAR kết thúc
+if scan_thread.is_alive(): scan_thread.join(timeout=1.0)
+# Lưu bản đồ cuối cùng
+try:
+final_map_name = f"final_map_{time.strftime('%Y%m%d_%H%M%S')}"
+print(f"Lưu bản đồ cuối cùng: {final_map_name}")
+if MAP_MANAGER_AVAILABLE and map_manager: # Tạo dữ liệu bản đồ với thông tin liên quan map_data = {
+'occupancy_map': np.reshape(np.frombuffer(map_bytes, dtype=np.uint8), (MAP_SIZE_PIXELS, MAP_SIZE_PIXELS)),
+'resolution': MAP_SIZE_METERS / MAP_SIZE_PIXELS, 'size_meters': MAP_SIZE_METERS,
+'path': robot_path
+}
+map_manager.save_map(final_map_name, map_data, waypoints)
+print(f"Đã lưu bản đồ cuối cùng với {len(waypoints)} điểm dừng vào hệ thống quản lý bản đồ")
+else:
+# Phương pháp lưu cũ
+plt.figure(figsize=(12, 12))
+# Chuyển đổi bản đồ từ dạng byte sang mảng numpy
+final_map = np.reshape(np.frombuffer(map_bytes, dtype=np.uint8), (MAP_SIZE_PIXELS, MAP_SIZE_PIXELS))
+plt.imshow(final_map, cmap='gray_r', origin='lower')
+# Vẽ đường đi của robot if robot_path:
+path_x = [p[0] for p in robot_path] path_y = [p[1] for p in robot_path]
+plt.plot(path_x, path_y, 'm-', linewidth=2, label="Đường đi của robot") # Vẽ các waypoints
+for name, (wx, wy) in waypoints.items(): plt.plot(wx, wy, 'g*', markersize=10) plt.annotate(name, (wx + 5, wy + 5), fontsize=8)
+plt.title("Bản đồ SLAM cuối cùng") plt.colorbar(label="Xác suất chiếm đóng") plt.savefig(final_map_name + ".png")
+except Exception as e:
+print(f"Lỗi khi lưu bản đồ cuối cùng: {e}")
+plt.ioff() plt.close('all')
+
+if  name  == ' main ': run_slam_with_breezy()
+
