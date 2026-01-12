@@ -1,0 +1,46 @@
+def timer_callback(self):
+        try:
+            # 1. Đọc dữ liệu từ cảm biến
+            # Thêm try-except riêng cho việc đọc để bắt lỗi "Too many retries"
+            try:
+                self.mlx.getFrame(self.frame)
+            except RuntimeError as e:
+                # Đây là nơi bắt lỗi "Too many retries"
+                # Không in ERROR log để tránh spam, chỉ in debug hoặc bỏ qua
+                # self.get_logger().debug('Frame read failed, skipping...')
+                return 
+            
+            # 2. Xử lý logic an toàn (Tuần tra công nghiệp)
+            max_temp = max(self.frame)
+            if max_temp > self.temp_threshold:
+                self.get_logger().warn(f'CẢNH BÁO QUÁ NHIỆT: {max_temp:.1f} độ C!')
+
+            # 3. Chuẩn bị ảnh để hiển thị
+            data_array = np.array(self.frame).reshape((24, 32))
+            
+            # Normalize
+            min_val = np.min(data_array)
+            max_val = np.max(data_array)
+            
+            if max_val == min_val:
+                norm_img = np.zeros_like(data_array, dtype=np.uint8)
+            else:
+                norm_img = (data_array - min_val) / (max_val - min_val) * 255
+                norm_img = norm_img.astype(np.uint8)
+            
+            # Phóng to và tô màu
+            status_img = cv2.resize(norm_img, (640, 480), interpolation=cv2.INTER_CUBIC)
+            color_img = cv2.applyColorMap(status_img, cv2.COLORMAP_JET)
+            
+            # 4. Gửi lên ROS topic
+            msg = self.bridge.cv2_to_imgmsg(color_img, encoding="bgr8")
+            msg.header.stamp = self.get_clock().now().to_msg()
+            msg.header.frame_id = "thermal_frame" 
+            
+            self.publisher_.publish(msg)
+            
+        except ValueError:
+            pass
+        except Exception as e:
+            # Chỉ log những lỗi lạ, không log lỗi đường truyền
+            self.get_logger().error(f'System Error: {str(e)}')
