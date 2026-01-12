@@ -30,7 +30,7 @@ class ThermalCameraNode(Node):
         
         # --- CẤU HÌNH ---
         self.target_fps = 4.0  # MLX90640 tối đa khoảng 8Hz, để 4Hz cho ổn định
-        self.i2c_frequency = 400000 # Phải khớp với /boot/firmware/config.txt
+        self.i2c_frequency = 100000 # Phải khớp với /boot/firmware/config.txt
         self.temp_threshold = 60.0 # Ngưỡng cảnh báo độ C
         
         # --- KHỞI TẠO PUBLISHER ---
