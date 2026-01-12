@@ -2,3 +2,9 @@ source ~/ros2_ws/install/setup.bash
 ros2 topic hz /thermal_image
 
 ros2 run rqt_image_view rqt_image_view
+
+sudo apt update
+sudo apt install ros-humble-web-video-server
+
+ros2 run web_video_server web_video_server
+
