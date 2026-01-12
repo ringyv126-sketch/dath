@@ -29,69 +29,76 @@ class ThermalCameraNode(Node):
         super().__init__('thermal_camera_node')
         
         # --- CẤU HÌNH ---
-        self.target_fps = 4.0  # MLX90640 tối đa khoảng 8Hz, để 4Hz cho ổn định
-        self.i2c_frequency = 100000 # Phải khớp với /boot/firmware/config.txt
-        self.temp_threshold = 60.0 # Ngưỡng cảnh báo độ C
+        self.target_fps = 2.0  # Giữ thấp để tránh quá tải I2C
+        self.temp_threshold = 60.0
         
         # --- KHỞI TẠO PUBLISHER ---
-        # Topic để xem trên Rviz
         self.publisher_ = self.create_publisher(Image, 'thermal_image', 10)
         
         # --- KHỞI TẠO PHẦN CỨNG ---
-        self.i2c = busio.I2C(board.SCL, board.SDA, frequency=self.i2c_frequency)
-        self.mlx = adafruit_mlx90640.MLX90640(self.i2c)
-        self.mlx.refresh_rate = adafruit_mlx90640.RefreshRate.REFRESH_4_HZ
+        # Tự động dùng frequency mặc định của hệ thống (đã set trong config.txt)
+        self.i2c = busio.I2C(board.SCL, board.SDA)
         
-        # Buffer chứa dữ liệu thô (24x32 = 768 pixels)
+        try:
+            self.mlx = adafruit_mlx90640.MLX90640(self.i2c)
+            self.mlx.refresh_rate = adafruit_mlx90640.RefreshRate.REFRESH_2_HZ
+        except Exception as e:
+            self.get_logger().error(f'Khong the ket noi MLX90640: {str(e)}')
+            # Nếu không kết nối được, node vẫn chạy nhưng không làm gì để tránh crash
+            self.mlx = None
+
         self.frame = [0] * 768
-        
-        # Công cụ chuyển đổi ROS-OpenCV
         self.bridge = CvBridge()
         
         # Timer
         self.timer = self.create_timer(1.0 / self.target_fps, self.timer_callback)
-        self.get_logger().info('Thermal Camera Node has started via I2C')
+        self.get_logger().info('Thermal Camera Node started (2Hz Mode)')
 
     def timer_callback(self):
+        if self.mlx is None:
+            return # Nếu camera chưa init được thì bỏ qua
+
         try:
-            # 1. Đọc dữ liệu từ cảm biến
-            self.mlx.getFrame(self.frame)
-            
-            # 2. Xử lý logic an toàn (Tuần tra công nghiệp)
+            # 1. Đọc dữ liệu (Có bắt lỗi Retry)
+            try:
+                self.mlx.getFrame(self.frame)
+            except RuntimeError:
+                # Lỗi này do đọc chậm hơn ghi -> Bỏ qua frame này, chờ frame sau
+                return 
+            except ValueError:
+                return
+
+            # 2. Xử lý logic an toàn
             max_temp = max(self.frame)
             if max_temp > self.temp_threshold:
                 self.get_logger().warn(f'CẢNH BÁO QUÁ NHIỆT: {max_temp:.1f} độ C!')
 
-            # 3. Chuẩn bị ảnh để hiển thị
-            # Chuyển list thành numpy array và reshape thành 24x32
+            # 3. Xử lý ảnh
             data_array = np.array(self.frame).reshape((24, 32))
             
-            # Normalize dữ liệu về khoảng 0-255 (để tạo ảnh)
-            # Dùng khoảng cố định 20C đến 50C để ảnh đỡ bị nháy sáng tối liên tục
-            # Hoặc dùng min/max động:
             min_val = np.min(data_array)
             max_val = np.max(data_array)
-            norm_img = (data_array - min_val) / (max_val - min_val) * 255
-            norm_img = norm_img.astype(np.uint8)
             
-            # Phóng to ảnh (Interpolation) để dễ nhìn hơn (từ 32x24 -> 640x480)
+            if max_val == min_val:
+                norm_img = np.zeros_like(data_array, dtype=np.uint8)
+            else:
+                norm_img = (data_array - min_val) / (max_val - min_val) * 255
+                norm_img = norm_img.astype(np.uint8)
+            
+            # Phóng to
             status_img = cv2.resize(norm_img, (640, 480), interpolation=cv2.INTER_CUBIC)
-            
-            # Tô màu (Heatmap) - dùng COLORMAP_JET hoặc INFERNO
+            # Tô màu
             color_img = cv2.applyColorMap(status_img, cv2.COLORMAP_JET)
             
-            # 4. Gửi lên ROS topic
+            # 4. Gửi lên ROS
             msg = self.bridge.cv2_to_imgmsg(color_img, encoding="bgr8")
             msg.header.stamp = self.get_clock().now().to_msg()
-            msg.header.frame_id = "thermal_frame" # Cần khai báo trong URDF sau này
+            msg.header.frame_id = "thermal_frame" 
             
             self.publisher_.publish(msg)
-            
-        except ValueError:
-            # Lỗi thường gặp khi I2C bị nghẽn
-            pass
+
         except Exception as e:
-            self.get_logger().error(f'Error: {str(e)}')
+            self.get_logger().error(f'System Error: {str(e)}')
 
 def main(args=None):
     rclpy.init(args=args)
