@@ -1,0 +1,51 @@
+nano test_cam.py
+
+import time
+import board
+import busio
+import adafruit_mlx90640
+import matplotlib.pyplot as plt
+
+# Khoi tao I2C
+i2c = busio.I2C(board.SCL, board.SDA, frequency=400000)
+
+# Khoi tao Camera
+mlx = adafruit_mlx90640.MLX90640(i2c)
+print("MLX90640 Serial number:", [hex(i) for i in mlx.serial_number])
+
+# Chuan bi mang du lieu (MLX90640 co 768 diem anh: 32x24)
+frame = [0] * 768
+
+# Doc thu 1 khung hinh de bo qua du lieu rac ban dau
+try:
+    mlx.getFrame(frame)
+except ValueError:
+    pass
+
+print("Dang doc du lieu... (Nhan Ctrl+C de dung)")
+
+while True:
+    try:
+        start_time = time.time()
+        mlx.getFrame(frame)
+        
+        # Tinh nhiet do trung binh, max, min
+        temp_max = max(frame)
+        temp_min = min(frame)
+        center_pixel = frame[384] # Diem giua (approx)
+        
+        print(f"Max: {temp_max:.1f}C | Min: {temp_min:.1f}C | Center: {center_pixel:.1f}C | FPS: {1/(time.time()-start_time):.1f}")
+        
+        # Luu anh nhiet (Optional - se lam cham FPS neu chay lien tuc)
+        # Chi luu khi can thiet hoac bo comment 3 dong duoi de test lan dau
+        # plt.imshow((reshape_frame(frame)), cmap='inferno')
+        # plt.savefig('thermal_output.png')
+        # plt.close()
+
+    except ValueError:
+        # Doi khi I2C bi loi packet, bo qua
+        continue
+    except KeyboardInterrupt:
+        break
+
+python test_cam.py
