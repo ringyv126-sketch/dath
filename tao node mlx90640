@@ -1,0 +1,122 @@
+# 1. Tạo thư mục workspace (nếu chưa có)
+mkdir -p ~/ros2_ws/src
+cd ~/ros2_ws/src
+
+# 2. Tạo package python
+ros2 pkg create --build-type ament_python thermal_camera_pkg --dependencies rclpy sensor_msgs cv_bridge
+
+pip install opencv-python numpy
+sudo apt install ros-humble-cv-bridge ros-humble-vision-opencv
+
+cd ~/ros2_ws/src/thermal_camera_pkg/thermal_camera_pkg
+touch thermal_node.py
+chmod +x thermal_node.py
+nano thermal_node.py
+
+#!/usr/bin/env python3
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import Image
+from cv_bridge import CvBridge
+import cv2
+import numpy as np
+import board
+import busio
+import adafruit_mlx90640
+
+class ThermalCameraNode(Node):
+    def __init__(self):
+        super().__init__('thermal_camera_node')
+        
+        # --- CẤU HÌNH ---
+        self.target_fps = 4.0  # MLX90640 tối đa khoảng 8Hz, để 4Hz cho ổn định
+        self.i2c_frequency = 400000 # Phải khớp với /boot/firmware/config.txt
+        self.temp_threshold = 60.0 # Ngưỡng cảnh báo độ C
+        
+        # --- KHỞI TẠO PUBLISHER ---
+        # Topic để xem trên Rviz
+        self.publisher_ = self.create_publisher(Image, 'thermal_image', 10)
+        
+        # --- KHỞI TẠO PHẦN CỨNG ---
+        self.i2c = busio.I2C(board.SCL, board.SDA, frequency=self.i2c_frequency)
+        self.mlx = adafruit_mlx90640.MLX90640(self.i2c)
+        self.mlx.refresh_rate = adafruit_mlx90640.RefreshRate.REFRESH_4_HZ
+        
+        # Buffer chứa dữ liệu thô (24x32 = 768 pixels)
+        self.frame = [0] * 768
+        
+        # Công cụ chuyển đổi ROS-OpenCV
+        self.bridge = CvBridge()
+        
+        # Timer
+        self.timer = self.create_timer(1.0 / self.target_fps, self.timer_callback)
+        self.get_logger().info('Thermal Camera Node has started via I2C')
+
+    def timer_callback(self):
+        try:
+            # 1. Đọc dữ liệu từ cảm biến
+            self.mlx.getFrame(self.frame)
+            
+            # 2. Xử lý logic an toàn (Tuần tra công nghiệp)
+            max_temp = max(self.frame)
+            if max_temp > self.temp_threshold:
+                self.get_logger().warn(f'CẢNH BÁO QUÁ NHIỆT: {max_temp:.1f} độ C!')
+
+            # 3. Chuẩn bị ảnh để hiển thị
+            # Chuyển list thành numpy array và reshape thành 24x32
+            data_array = np.array(self.frame).reshape((24, 32))
+            
+            # Normalize dữ liệu về khoảng 0-255 (để tạo ảnh)
+            # Dùng khoảng cố định 20C đến 50C để ảnh đỡ bị nháy sáng tối liên tục
+            # Hoặc dùng min/max động:
+            min_val = np.min(data_array)
+            max_val = np.max(data_array)
+            norm_img = (data_array - min_val) / (max_val - min_val) * 255
+            norm_img = norm_img.astype(np.uint8)
+            
+            # Phóng to ảnh (Interpolation) để dễ nhìn hơn (từ 32x24 -> 640x480)
+            status_img = cv2.resize(norm_img, (640, 480), interpolation=cv2.INTER_CUBIC)
+            
+            # Tô màu (Heatmap) - dùng COLORMAP_JET hoặc INFERNO
+            color_img = cv2.applyColorMap(status_img, cv2.COLORMAP_JET)
+            
+            # 4. Gửi lên ROS topic
+            msg = self.bridge.cv2_to_imgmsg(color_img, encoding="bgr8")
+            msg.header.stamp = self.get_clock().now().to_msg()
+            msg.header.frame_id = "thermal_frame" # Cần khai báo trong URDF sau này
+            
+            self.publisher_.publish(msg)
+            
+        except ValueError:
+            # Lỗi thường gặp khi I2C bị nghẽn
+            pass
+        except Exception as e:
+            self.get_logger().error(f'Error: {str(e)}')
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = ThermalCameraNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
+
+nano ~/ros2_ws/src/thermal_camera_pkg/setup.py
+
+entry_points={
+        'console_scripts': [
+            'thermal_node = thermal_camera_pkg.thermal_node:main',
+        ],
+    },
+
+cd ~/ros2_ws
+colcon build --packages-select thermal_camera_pkg --symlink-install
+source install/setup.bash
+
+ros2 run thermal_camera_pkg thermal_node
