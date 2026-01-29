@@ -1,0 +1,32 @@
+ls -l /dev/serial/by-id/
+
+usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_0001-if00-port0
+
+ls -l /dev/serial/by-id/
+
+usb-SLAMTEC_RPLIDAR_A1M8_0000000001-if00
+
+sudo nano /etc/udev/rules.d/99-ros-usb.rules
+
+# ESP32
+SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", SYMLINK+="esp32", MODE="0666"
+
+# RPLidar A1M8
+SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", SYMLINK+="rplidar", MODE="0666"
+
+udevadm info -a -n /dev/ttyUSB0 | grep idVendor
+udevadm info -a -n /dev/ttyUSB0 | grep idProduct
+
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+
+ls -l /dev/esp32
+ls -l /dev/rplidar
+
+/dev/esp32  -> ttyUSBx
+/dev/rplidar -> ttyUSBy
+
+serial_port: /dev/rplidar
+
+/dev/esp32
+
