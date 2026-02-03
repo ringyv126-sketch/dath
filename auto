@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+import rclpy
+from rclpy.node import Node
+from rclpy.action import ActionClient
+from nav2_msgs.action import NavigateToPose
+
+import board
+import busio
+import adafruit_mlx90640
+import numpy as np
+import cv2
+from cv_bridge import CvBridge
+from sensor_msgs.msg import Image
+
+
+class ThermalNavNode(Node):
+    def __init__(self):
+        super().__init__('thermal_nav_node')
+
+        # ===== CẤU HÌNH =====
+        self.target_fps = 2.0
+        self.temp_threshold = 70.0
+
+        # ===== NAV2 =====
+        self.cli = ActionClient(self, NavigateToPose, 'navigate_to_pose')
+        self.cli.wait_for_server()
+
+        # ===== WAYPOINT =====
+       # ===== WAYPOINT (lấy từ RViz) =====
+	self.point_a = (-0.0365895, -0.00652469, 0.999883, 0.0152824)  
+	self.point_b = (1.93372, 0.692968, 0.999883, 0.0152824)     
+
+	self.targets = [self.point_a, self.point_b]
+
+
+        # ===== STATE =====
+        self.loop_mode = False
+        self.overheat = False
+        self.goal_handle = None
+        self.current_target_index = 0
+        self.sending_goal = False
+
+        # ===== CAMERA =====
+        self.publisher_ = self.create_publisher(Image, 'thermal_image', 10)
+        self.bridge = CvBridge()
+
+        self.i2c = busio.I2C(board.SCL, board.SDA)
+        try:
+            self.mlx = adafruit_mlx90640.MLX90640(self.i2c)
+            self.mlx.refresh_rate = adafruit_mlx90640.RefreshRate.REFRESH_2_HZ
+        except Exception as e:
+            self.get_logger().error(f'Cannot init MLX90640: {e}')
+            self.mlx = None
+
+        self.frame = [0] * 768
+
+        # ===== TIMER =====
+        self.timer = self.create_timer(1.0 / self.target_fps, self.timer_callback)
+        self.get_logger().info("Thermal + Navigation node started")
+
+    # =======================
+    def timer_callback(self):
+        if self.mlx is None:
+            return
+
+        try:
+            try:
+                self.mlx.getFrame(self.frame)
+            except (RuntimeError, ValueError):
+                return
+
+            max_temp = max(self.frame)
+
+            # ===== LOGIC NHIỆT ĐỘ =====
+            if max_temp >= self.temp_threshold:
+                if not self.overheat:
+                    self.get_logger().warn(f"OVERHEAT {max_temp:.1f}°C → STOP")
+                    self.overheat = True
+                    self.loop_mode = False
+                    self.cancel_goal()
+            else:
+                if self.overheat:
+                    self.get_logger().info(f"Temp normal {max_temp:.1f}°C → RESUME")
+                    self.overheat = False
+                    self.loop_mode = True
+                    self.current_target_index = 0
+                    self.send_next_goal()
+                elif not self.loop_mode:
+                    self.loop_mode = True
+                    self.current_target_index = 0
+                    self.send_next_goal()
+
+            # ===== XỬ LÝ ẢNH (GIỮ NGUYÊN) =====
+            data_array = np.array(self.frame).reshape((24, 32))
+            norm_img = cv2.normalize(data_array, None, 0, 255, cv2.NORM_MINMAX)
+            norm_img = norm_img.astype(np.uint8)
+
+            color_img = cv2.applyColorMap(
+                cv2.resize(norm_img, (640, 480), interpolation=cv2.INTER_CUBIC),
+                cv2.COLORMAP_JET
+            )
+
+            msg = self.bridge.cv2_to_imgmsg(color_img, encoding="bgr8")
+            msg.header.stamp = self.get_clock().now().to_msg()
+            msg.header.frame_id = "thermal_frame"
+            self.publisher_.publish(msg)
+
+        except Exception as e:
+            self.get_logger().error(str(e))
+
+    # =======================
+    def send_next_goal(self):
+        if not self.loop_mode or self.sending_goal:
+            return
+        self.send_goal(*self.targets[self.current_target_index])
+
+    # =======================
+    def send_goal(self, x, y, z, w):
+        self.sending_goal = True
+
+        goal = NavigateToPose.Goal()
+        goal.pose.header.frame_id = 'map'
+        goal.pose.header.stamp = self.get_clock().now().to_msg()
+        goal.pose.pose.position.x = x
+        goal.pose.pose.position.y = y
+        goal.pose.pose.orientation.z = z
+        goal.pose.pose.orientation.w = w
+
+        self.get_logger().info(f"Go to ({x:.2f}, {y:.2f})")
+        self.cli.send_goal_async(goal).add_done_callback(self.goal_response_callback)
+
+    # =======================
+    def goal_response_callback(self, future):
+        goal_handle = future.result()
+        if not goal_handle or not goal_handle.accepted:
+            self.sending_goal = False
+            return
+
+        self.goal_handle = goal_handle
+        goal_handle.get_result_async().add_done_callback(self.goal_result_callback)
+
+    # =======================
+    def goal_result_callback(self, future):
+        self.sending_goal = False
+        result = future.result()
+        if not result or result.status != 4:
+            return
+
+        if self.loop_mode:
+            self.current_target_index = 1 - self.current_target_index
+            self.send_next_goal()
+
+    # =======================
+    def cancel_goal(self):
+        if self.goal_handle:
+            self.goal_handle.cancel_goal_async()
+            self.goal_handle = None
+        self.sending_goal = False
+
+
+def main():
+    rclpy.init()
+    node = ThermalNavNode()
+    rclpy.spin(node)
+    node.destroy_node()
+    rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
